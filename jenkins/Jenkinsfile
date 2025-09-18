@@ -1,7 +1,7 @@
 pipeline {
   agent any
   environment {
-    REGISTRY_HOST = "localhost:8082"
+    REGISTRY_HOST = "192.168.0.14:8082"
     REGISTRY_REPO = "docker-local"
     REGISTRY      = "${env.REGISTRY_HOST}/${env.REGISTRY_REPO}"
 
@@ -12,7 +12,7 @@ pipeline {
     CHECKMARX_BASE_URL = credentials('CHECKMARX_BASE_URL')
     CHECKMARX_API_KEY  = credentials('CHECKMARX_API_KEY')
 
-    HELM_REPO_UPLOAD   = "http://localhost:8082/artifactory/helm-local/"
+    HELM_REPO_UPLOAD = "http://192.168.0.14:8082/artifactory/helm-local/"
   }
 
   stages {
