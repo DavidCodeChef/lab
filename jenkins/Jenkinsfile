@@ -1,0 +1,139 @@
+pipeline {
+  agent any
+  environment {
+    REGISTRY_HOST = "localhost:8082"
+    REGISTRY_REPO = "docker-local"
+    REGISTRY      = "${env.REGISTRY_HOST}/${env.REGISTRY_REPO}"
+
+    REG_CREDS     = credentials('JF_USER')
+    JF_TOKEN      = credentials('JF_PASS')
+
+    CHECKMARX_ENABLED  = "false"
+    CHECKMARX_BASE_URL = credentials('CHECKMARX_BASE_URL')
+    CHECKMARX_API_KEY  = credentials('CHECKMARX_API_KEY')
+
+    HELM_REPO_UPLOAD   = "http://localhost:8082/artifactory/helm-local/"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('SAST (Checkmarx)') {
+      when { expression { env.CHECKMARX_ENABLED == "true" } }
+      steps {
+        sh '''
+          echo "== Checkmarx AST Scan =="
+          echo "(placeholder for now)"
+        '''
+      }
+    }
+
+    stage('Build & Test') {
+      steps {
+        dir('app') {
+          sh 'npm ci || npm install && npm test'
+        }
+      }
+    }
+
+    stage('Lint & Audit') {
+      steps {
+        dir('app') {
+          sh 'npx --yes eslint . || true'
+          sh 'npm audit --audit-level=high || true'
+        }
+      }
+    }
+
+    stage('Docker Build & Push') {
+      steps {
+        sh '''
+          echo "$REG_CREDS_PSW" | docker login "$REGISTRY_HOST" -u "$REG_CREDS_USR" --password-stdin
+          IMAGE="$REGISTRY/sample-app:build-${BUILD_NUMBER}"
+          docker build -t "$IMAGE" app
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" > image.env
+        '''
+        archiveArtifacts artifacts: 'image.env', fingerprint: true
+      }
+    }
+
+    stage('SBOM & Scan') {
+      steps {
+        sh '''
+          source image.env
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft $IMAGE -o cyclonedx-json > sbom.json
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy image --severity HIGH,CRITICAL --exit-code 0 --ignore-unfixed --no-progress $IMAGE > trivy.txt
+        '''
+        archiveArtifacts artifacts: 'sbom.json,trivy.txt', fingerprint: true
+      }
+    }
+
+    stage('Helm Package & Upload') {
+      steps {
+        sh '''
+          mkdir -p dist helm/app/templates
+          cat > helm/app/Chart.yaml <<'YAML'
+apiVersion: v2
+name: app
+version: 0.1.${BUILD_NUMBER}
+appVersion: "${BUILD_NUMBER}"
+type: application
+description: Sample app chart
+YAML
+
+          cat > helm/app/values.yaml <<'YAML'
+image:
+  repository: REPO
+  tag: TAG
+service:
+  port: 80
+  targetPort: 3000
+replicaCount: 1
+YAML
+
+          cat > helm/app/templates/deployment.yaml <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: app }
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector: { matchLabels: { app: app } }
+  template:
+    metadata: { labels: { app: app } }
+    spec:
+      containers:
+      - name: app
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        ports: [ { containerPort: {{ .Values.service.targetPort }} } ]
+YAML
+
+          cat > helm/app/templates/service.yaml <<'YAML'
+apiVersion: v1
+kind: Service
+metadata: { name: app }
+spec:
+  selector: { app: app }
+  ports:
+  - port: {{ .Values.service.port }}
+    targetPort: {{ .Values.service.targetPort }}
+YAML
+
+          source image.env
+          REPO=$(echo "$IMAGE" | sed 's/:.*//')
+          TAG=$(echo "$IMAGE"  | sed 's/^.*://')
+          sed -i "s|REPO|$REPO|; s|TAG|$TAG|" helm/app/values.yaml
+
+          helm package helm/app -d dist
+          CHART_FILE=$(ls dist/*.tgz | head -1)
+          curl -u "$REG_CREDS_USR:$REG_CREDS_PSW" -T "$CHART_FILE" "$HELM_REPO_UPLOAD"
+        '''
+        archiveArtifacts artifacts: 'dist/*.tgz', fingerprint: true
+      }
+    }
+  }
+}
